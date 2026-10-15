@@ -1,0 +1,602 @@
+#!/bin/bash
+# macOS 同梱の bash 3.2 で動かす。連想配列・mapfile・${var,,} は使わない
+set -u
+
+SOURCE_ID="ymegane.jira-pr"
+HERDR="${HERDR_BIN_PATH:-herdr}"
+CONFIG_DIR="${HERDR_PLUGIN_CONFIG_DIR:-}"
+STATE_DIR="${HERDR_PLUGIN_STATE_DIR:-}"
+TAB="$(printf '\t')"
+# fzf のバインドと xargs から自分を呼び直す。どちらも cwd が違いうるので絶対パスにする
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+# board の再取得と xargs の子プロセスへは環境変数で渡す
+FORCE_FETCH="${JIRA_PR_FORCE:-0}"
+FORCE_REPORT=0
+
+log() { printf 'jira-pr: %s\n' "$*" >&2; }
+
+usage() {
+  cat <<'EOF'
+usage: jira-pr <command>
+  refresh --all [--force]    全エージェント pane を解決してトークンを報告する
+  refresh --pane ID [--force]
+  status                     全エージェント pane の解決結果を表示する（報告はしない）
+  open pr|jira               HERDR_PANE_ID の PR / Jira をブラウザで開く
+  open-board                 board をポップアップで開く
+  board                      pane と worktree の一覧を fzf で出す（ポップアップの中で動く）
+  event                      herdr の startup / event フックから呼ぶ
+EOF
+}
+
+init_dirs() {
+  # herdr 外から手で実行したときは、herdr が管理するのと同じ config dir を使う
+  if [ -z "${CONFIG_DIR}" ]; then
+    CONFIG_DIR="$("${HERDR}" plugin config-dir "${SOURCE_ID}" 2>/dev/null | tail -n 1)"
+  fi
+  # 共有の /tmp に落とすと、他ユーザーが置いた symlink 経由でキャッシュ書き込みを横取りされうる
+  if [ -z "${STATE_DIR}" ]; then
+    STATE_DIR="${HOME}/Library/Caches/herdr-jira-pr"
+  fi
+  umask 077
+  mkdir -p "${STATE_DIR}"
+  if [ -L "${STATE_DIR}" ] || [ ! -O "${STATE_DIR}" ]; then
+    log "${STATE_DIR} が自分の所有ディレクトリではない"
+    exit 1
+  fi
+}
+
+load_config() {
+  JIRA_BASE_URL=""
+  JIRA_EMAIL=""
+  KEYCHAIN_SERVICE="herdr-jira-pr"
+  KEY_PATTERN='[A-Z][A-Z0-9]+-[0-9]+'
+  CACHE_TTL_SEC=300
+  if [ -n "${CONFIG_DIR}" ] && [ -f "${CONFIG_DIR}/config.env" ]; then
+    # shellcheck disable=SC1091
+    . "${CONFIG_DIR}/config.env"
+  fi
+  JIRA_BASE_URL="${JIRA_BASE_URL%/}"
+}
+
+now() { date +%s; }
+
+mtime_of() { stat -f %m "$1" 2>/dev/null || echo 0; }
+
+cache_fresh() {
+  [ -f "$1" ] || return 1
+  [ "${FORCE_FETCH}" = 1 ] && return 1
+  [ $(( $(now) - $(mtime_of "$1") )) -lt "${CACHE_TTL_SEC}" ]
+}
+
+write_atomic() {
+  local tmp
+  tmp="$(mktemp "$1.XXXXXX")" || return 1
+  cat >"${tmp}" && mv -f "${tmp}" "$1"
+}
+
+hash_of() { printf '%s' "$1" | shasum | cut -c1-16; }
+
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_'; }
+
+extract_key() { printf '%s\n' "$1" | grep -oE "${KEY_PATTERN}" | head -n 1; }
+
+# 数字の途中で切れた一致を弾く。ABC-12 が ABC-123 のブランチに当たらないようにする
+contains_key() {
+  printf '%s\n' "$1" | grep -qE "(^|[^A-Za-z0-9])$2([^0-9]|$)"
+}
+
+# 出力: "<path>\t<branch>"
+find_worktree() {
+  git -C "$1" worktree list --porcelain 2>/dev/null |
+    awk '/^worktree /{p=substr($0,10)} /^branch /{b=substr($0,8); sub("^refs/heads/","",b); print p "\t" b}' |
+    while IFS="${TAB}" read -r p b; do
+      if contains_key "${b}" "$2"; then
+        printf '%s\t%s\n' "${p}" "${b}"
+        break
+      fi
+    done
+}
+
+find_branch() {
+  git -C "$1" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null |
+    while read -r b; do
+      if contains_key "${b}" "$2"; then
+        printf '%s\n' "${b}"
+        break
+      fi
+    done
+}
+
+# gh や Jira が落ちているときは期限切れのキャッシュでも出す。何も出さないより古い値のほうが役に立つ
+fetch_pr() {
+  local dir="$1" branch="$2" key="$3" common cache json
+  local fields="number,state,isDraft,reviewDecision,statusCheckRollup,url,headRefName"
+  common="$(cd "${dir}" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  cache="${STATE_DIR}/pr-$(hash_of "${common}|${branch}|${key}").json"
+  if cache_fresh "${cache}"; then
+    cat "${cache}"
+    return 0
+  fi
+  json=""
+  if [ -n "${branch}" ]; then
+    json="$(cd "${dir}" && gh pr list --head "${branch}" --state all --limit 5 --json "${fields}" 2>/dev/null)" || json=""
+  fi
+  if { [ -z "${json}" ] || [ "${json}" = "[]" ]; } && [ -n "${key}" ]; then
+    json="$(cd "${dir}" && gh pr list --search "${key} in:title" --state all --limit 5 --json "${fields}" 2>/dev/null)" || json=""
+  fi
+  if [ -z "${json}" ]; then
+    [ -f "${cache}" ] && cat "${cache}"
+    return 0
+  fi
+  printf '%s' "${json}" | jq -c 'sort_by(.state != "OPEN") | .[0]' | write_atomic "${cache}"
+  cat "${cache}"
+}
+
+jira_auth_ok() {
+  local code
+  code="$(printf 'user = "%s:%s"\n' "${JIRA_EMAIL}" "$1" |
+    curl -sS --max-time 10 -K - -o /dev/null -w '%{http_code}' "${JIRA_BASE_URL}/rest/api/3/myself" 2>/dev/null)"
+  [ "${code}" = 200 ]
+}
+
+fetch_jira() {
+  local key="$1" cache token body code
+  cache="${STATE_DIR}/jira-${key}.json"
+  if cache_fresh "${cache}"; then
+    cat "${cache}"
+    return 0
+  fi
+  if [ -z "${JIRA_BASE_URL}" ] || [ -z "${JIRA_EMAIL}" ]; then
+    return 0
+  fi
+  token="$(security find-generic-password -s "${KEYCHAIN_SERVICE}" -a "${JIRA_EMAIL}" -w 2>/dev/null)" || {
+    log "Keychain に service=${KEYCHAIN_SERVICE} account=${JIRA_EMAIL} の項目がない"
+    return 0
+  }
+  body="$(mktemp "${STATE_DIR}/jira-body.XXXXXX")" || return 0
+  # トークンを argv に載せると ps から見えるので、curl の設定は標準入力から渡す
+  code="$(printf 'user = "%s:%s"\n' "${JIRA_EMAIL}" "${token}" |
+    curl -sS --max-time 10 -K - -H 'Accept: application/json' -o "${body}" -w '%{http_code}' \
+      "${JIRA_BASE_URL}/rest/api/3/issue/${key}?fields=status,summary" 2>/dev/null)" || code="000"
+  case "${code}" in
+    200)
+      jq -c '{key, status: .fields.status.name, category: .fields.status.statusCategory.key, summary: .fields.summary}' "${body}" |
+        write_atomic "${cache}"
+      ;;
+    404)
+      # Jira Cloud は認証に失敗したリクエストを匿名として扱い、課題に 404 を返す。
+      # /myself で認証を確かめ、失敗ならキャッシュせず認証エラーとして出す
+      if jira_auth_ok "${token}"; then
+        jq -nc --arg key "${key}" '{key: $key, status: "not found", category: "error"}' | write_atomic "${cache}"
+      else
+        log "Jira の認証に失敗した。JIRA_EMAIL と Keychain のトークンを確認する"
+        rm -f "${body}"
+        jq -nc --arg key "${key}" '{key: $key, status: "auth✗", category: "error"}'
+        return 0
+      fi
+      ;;
+    401)
+      log "Jira の認証に失敗した。JIRA_EMAIL と Keychain のトークンを確認する"
+      rm -f "${body}"
+      jq -nc --arg key "${key}" '{key: $key, status: "auth✗", category: "error"}'
+      return 0
+      ;;
+    *)
+      log "Jira ${key}: HTTP ${code}"
+      ;;
+  esac
+  rm -f "${body}"
+  [ -f "${cache}" ] && cat "${cache}"
+  return 0
+}
+
+jira_url() {
+  if [ -n "$1" ] && [ -n "${JIRA_BASE_URL}" ]; then
+    printf '%s/browse/%s' "${JIRA_BASE_URL}" "$1"
+  fi
+}
+
+# キーは Jira の行に出ているので、狭い表示では worktree 名から外す
+short_wt() {
+  local name short
+  name="$(basename "$1")"
+  if [ -n "$2" ]; then
+    short="$(printf '%s' "${name}" | sed -E "s/(^|[-_\/])$2([-_]|$)/\1/; s/^[-_]+//; s/[-_]+$//")"
+    [ -n "${short}" ] && name="${short}"
+  fi
+  printf '%s' "${name}"
+}
+
+# サイドバーとボードで状態の判定とアイコンを揃えるため、jq の定義を共有する。
+# アイコンは Nerd Font の codepoint。ソースに不可視文字を直接書かないよう \u エスケープで組み立てる
+JQ_DEFS='
+def pr_kind:
+  if .state == "OPEN" then (if .isDraft then "pr_draft" else "pr_open" end)
+  elif .state == "MERGED" then "pr_merged" else "pr_closed" end;
+def ci_kind:
+  [.statusCheckRollup[]? | if ((.conclusion // "") != "") then .conclusion else (.state // "PENDING") end] as $c
+  | if ($c | length) == 0 then null
+    elif any($c[]; . == "FAILURE" or . == "ERROR" or . == "TIMED_OUT" or . == "CANCELLED" or . == "ACTION_REQUIRED" or . == "STARTUP_FAILURE") then "ci_ng"
+    elif any($c[]; . == "PENDING" or . == "EXPECTED" or . == "IN_PROGRESS" or . == "QUEUED") then "ci_wait"
+    else "ci_ok" end;
+def rv_kind: {"APPROVED": "rv_ok", "CHANGES_REQUESTED": "rv_ng", "REVIEW_REQUIRED": "rv_wait"}[.reviewDecision // ""];
+def jira_kind: {"new": "jira_new", "indeterminate": "jira_doing", "done": "jira_done", "error": "jira_err"}[.category // "new"] // "jira_new";
+def icon:
+  {"jira": "", "pr_open": "", "pr_draft": "", "pr_merged": "", "pr_closed": "",
+   "ci_ok": "", "ci_ng": "", "ci_wait": "",
+   "rv_ok": "", "rv_ng": "", "rv_wait": "", "wt": ""}[.];
+def mismatch($branch): if ($branch != "" and .headRefName != $branch) then " ⚠" else "" end;
+'
+
+# herdr のサイドバーはトークン単位でしか色を指定できない。状態ごとに別トークンへ振り分け、
+# 該当する 1 つにだけ値を入れることで、config.toml 側の色指定で状態を色分けする
+ALL_TOKENS="jira_new jira_doing jira_done jira_err pr_open pr_draft pr_merged pr_closed ci_ok ci_ng ci_wait rv_ok rv_ng rv_wait wt"
+
+# 標準入力: resolve_pane のレコード。$1: 短縮済みの worktree 名
+build_tokens() {
+  jq -c --arg all "${ALL_TOKENS}" --arg wt "$1" "${JQ_DEFS}"'
+    . as $r
+    | ($all | split(" ") | map({(.): ""}) | add)
+    + (if ($r.key // "") == "" then {} else
+        ($r.jira // {}) as $j
+        | {($j | jira_kind): (("jira" | icon) + " " + $r.key + (if ($j.status // "") != "" then " " + $j.status else "" end))}
+      end)
+    + (if $r.pr == null then {} else
+        ($r.pr | pr_kind) as $k
+        | {($k): (($k | icon) + " #" + ($r.pr.number | tostring) + ($r.pr | mismatch($r.branch // "")))}
+        + (if $r.pr.state == "OPEN" then
+            ([($r.pr | ci_kind), ($r.pr | rv_kind)] | map(select(. != null) | {(.): (. | icon)}) | add // {})
+          else {} end)
+      end)
+    + (if $wt != "" then {wt: (("wt" | icon) + " " + $wt)} else {} end)'
+}
+
+report_tokens() {
+  local pane_id="$1" k v
+  local args=(pane report-metadata "${pane_id}" --source "${SOURCE_ID}")
+  while IFS="${TAB}" read -r k v; do
+    if [ -n "${v}" ]; then args+=(--token "${k}=${v}"); else args+=(--clear-token "${k}"); fi
+  done < <(printf '%s' "$2" | jq -r 'to_entries[] | "\(.key)\t\(.value)"')
+  "${HERDR}" "${args[@]}" >/dev/null || log "report-metadata ${pane_id} に失敗"
+}
+
+# 1 行の JSON を出す: {pane_id, workspace_id, tab_id, agent, cwd, key, key_from, wt_path, branch, jira, pr}
+resolve_pane() {
+  local pane_id="$1" pane agent cwd="" key="" key_from="" branch="" pr_branch="" wt_path="" in_git=0 line
+  local jira_json="" pr_json=""
+
+  pane="$("${HERDR}" pane get "${pane_id}" 2>/dev/null | jq -c '.result.pane // empty')"
+  [ -n "${pane}" ] || return 0
+  agent="$(printf '%s' "${pane}" | jq -r '.agent // empty')"
+  if [ -z "${agent}" ]; then
+    jq -nc --arg id "${pane_id}" '{pane_id: $id, agent: null}'
+    return 0
+  fi
+
+  cwd="$(printf '%s' "${pane}" | jq -r '.foreground_cwd // .cwd // empty')"
+  if [ -n "${cwd}" ] && git -C "${cwd}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    in_git=1
+    branch="$(git -C "${cwd}" symbolic-ref --short -q HEAD)"
+    key="$(extract_key "${branch}")"
+    if [ -n "${key}" ]; then
+      key_from="branch"
+      pr_branch="${branch}"
+      wt_path="$(git -C "${cwd}" rev-parse --show-toplevel)"
+    fi
+  fi
+
+  # 本体チェックアウトで起動したエージェントは cwd のブランチにキーが無い。
+  # Claude Code のセッション名（pane ラベル / ターミナルタイトル）からキーを取り、worktree を逆引きする
+  if [ -z "${key}" ]; then
+    key="$(extract_key "$(printf '%s' "${pane}" | jq -r '[.label, .terminal_title_stripped] | map(select(. != null)) | join(" ")')")"
+    if [ -n "${key}" ]; then
+      key_from="title"
+      if [ "${in_git}" = 1 ]; then
+        line="$(find_worktree "${cwd}" "${key}")"
+        if [ -n "${line}" ]; then
+          wt_path="${line%%"${TAB}"*}"
+          pr_branch="${line#*"${TAB}"}"
+        else
+          pr_branch="$(find_branch "${cwd}" "${key}")"
+        fi
+      fi
+    fi
+  fi
+
+  if [ -n "${key}" ]; then
+    jira_json="$(fetch_jira "${key}")"
+  fi
+  if [ "${in_git}" = 1 ] && { [ -n "${pr_branch}" ] || [ -n "${key}" ]; }; then
+    pr_json="$(fetch_pr "${wt_path:-${cwd}}" "${pr_branch}" "${key}")"
+  fi
+
+  jq -nc --argjson pane "${pane}" --arg cwd "${cwd}" --arg key "${key}" --arg from "${key_from}" \
+    --arg wt "${wt_path}" --arg branch "${pr_branch}" \
+    --argjson jira "${jira_json:-null}" --argjson pr "${pr_json:-null}" \
+    '{pane_id: $pane.pane_id, workspace_id: $pane.workspace_id, tab_id: $pane.tab_id, agent: $pane.agent,
+      cwd: $cwd, key: $key, key_from: $from, wt_path: $wt, branch: $branch, jira: $jira, pr: $pr}'
+}
+
+refresh_pane() {
+  local pane_id="$1" rec state_file tokens prev key wt_path wt_short=""
+  state_file="${STATE_DIR}/pane-$(sanitize "${pane_id}").json"
+
+  rec="$(resolve_pane "${pane_id}")"
+  [ -n "${rec}" ] || return 0
+  if [ -z "$(printf '%s' "${rec}" | jq -r '.agent // empty')" ]; then
+    if [ -f "${state_file}" ]; then
+      report_tokens "${pane_id}" "$(printf '%s' "${rec}" | build_tokens "")"
+      rm -f "${state_file}"
+    fi
+    return 0
+  fi
+
+  key="$(printf '%s' "${rec}" | jq -r '.key')"
+  wt_path="$(printf '%s' "${rec}" | jq -r '.wt_path')"
+  [ -n "${wt_path}" ] && wt_short="$(short_wt "${wt_path}" "${key}")"
+  tokens="$(printf '%s' "${rec}" | build_tokens "${wt_short}")"
+
+  prev="$( [ -f "${state_file}" ] && jq -c '.tokens // empty' "${state_file}" 2>/dev/null)"
+  # 0.1.0 は jira / pr という名前で報告していた。表示されなくなった古いトークンを一度だけ消す
+  if printf '%s' "${prev}" | jq -e 'has("jira") or has("pr")' >/dev/null 2>&1; then
+    "${HERDR}" pane report-metadata "${pane_id}" --source "${SOURCE_ID}" --clear-token jira --clear-token pr >/dev/null 2>&1
+  fi
+  # pane.focused はフォーカス移動のたびに来る。値が変わらない報告は送らない
+  if [ "${FORCE_REPORT}" = 1 ] || [ "${tokens}" != "${prev}" ]; then
+    report_tokens "${pane_id}" "${tokens}"
+  fi
+
+  jq -nc --argjson tokens "${tokens}" --arg key "${key}" --arg wt "${wt_path}" \
+    --arg jira_url "$(jira_url "${key}")" \
+    --arg pr_url "$(printf '%s' "${rec}" | jq -r '.pr.url // empty')" \
+    '{tokens: $tokens, key: $key, wt_path: $wt, jira_url: $jira_url, pr_url: $pr_url}' | write_atomic "${state_file}"
+}
+
+# 同じ pane へのフックは短時間に重なる（フォーカスの往復、起動直後の agent_detected と focused）。先行に任せて後続は捨てる
+with_pane_lock() {
+  local lock
+  lock="${STATE_DIR}/lock-$(sanitize "$1")"
+  if ! mkdir "${lock}" 2>/dev/null; then
+    [ $(( $(now) - $(mtime_of "${lock}") )) -gt 120 ] || return 0
+    rmdir "${lock}" 2>/dev/null
+    mkdir "${lock}" 2>/dev/null || return 0
+  fi
+  refresh_pane "$1"
+  rmdir "${lock}" 2>/dev/null
+}
+
+agent_panes() {
+  "${HERDR}" pane list 2>/dev/null | jq -r '.result.panes[]? | select(.agent != null) | .pane_id'
+}
+
+refresh_all() {
+  local id
+  # エージェントが抜けた pane のトークンも消すため、前回報告した pane も対象に含める
+  {
+    agent_panes
+    for f in "${STATE_DIR}"/pane-*.json; do
+      [ -f "${f}" ] || continue
+      basename "${f}" .json | sed 's/^pane-//; s/_/:/'
+    done
+  } | sort -u | while read -r id; do
+    [ -n "${id}" ] && with_pane_lock "${id}"
+  done
+}
+
+cmd_refresh() {
+  local target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) target="--all" ;;
+      --pane) shift; target="${1:-}" ;;
+      --force) FORCE_FETCH=1; FORCE_REPORT=1 ;;
+      *) usage; exit 2 ;;
+    esac
+    shift
+  done
+  case "${target}" in
+    "") usage; exit 2 ;;
+    --all) refresh_all ;;
+    *) with_pane_lock "${target}" ;;
+  esac
+}
+
+cmd_event() {
+  local ev="${HERDR_PLUGIN_EVENT:-}" ej="${HERDR_PLUGIN_EVENT_JSON:-}" pane_id
+  [ -n "${ej}" ] || ej='{}'
+  case "${ev}" in
+    startup)
+      # トークンはサーバ再起動で消える。前回と同じ値でも報告し直す
+      FORCE_REPORT=1
+      refresh_all
+      ;;
+    worktree.*)
+      refresh_all
+      ;;
+    pane.*)
+      pane_id="$(printf '%s' "${ej}" | jq -r '(.data // .) | (.pane_id // .pane.pane_id // empty)' 2>/dev/null)"
+      pane_id="${pane_id:-${HERDR_PANE_ID:-}}"
+      [ -n "${pane_id}" ] && with_pane_lock "${pane_id}"
+      ;;
+    *)
+      log "unknown event: ${ev}"
+      ;;
+  esac
+}
+
+cmd_status() {
+  printf 'pane\tagent\tkey\tfrom\tworktree\tbranch\ttokens\n'
+  local rec
+  agent_panes | while read -r id; do
+    rec="$(resolve_pane "${id}")"
+    printf '%s' "${rec}" | jq -r --argjson t "$(printf '%s' "${rec}" | build_tokens "")" \
+      '[.pane_id, .agent, (.key | if . == "" then "-" else . end), (.key_from | if . == "" then "-" else . end),
+        (.wt_path | if . == "" then "-" else . end), (.branch | if . == "" then "-" else . end),
+        ($t | to_entries | map(select(.value != "") | "\(.key)=\(.value)") | join(" ") | if . == "" then "-" else . end)] | @tsv'
+  done
+}
+
+cmd_open() {
+  local what="${1:-}" ctx="${HERDR_PLUGIN_CONTEXT_JSON:-}" pane_id url state_file
+  case "${what}" in pr | jira) ;; *) usage; exit 2 ;; esac
+  pane_id="${HERDR_PANE_ID:-}"
+  if [ -z "${pane_id}" ] && [ -n "${ctx}" ]; then
+    pane_id="$(printf '%s' "${ctx}" | jq -r '.focused_pane_id // empty' 2>/dev/null)"
+  fi
+  [ -n "${pane_id}" ] || { log "対象の pane が分からない"; exit 1; }
+  with_pane_lock "${pane_id}"
+  state_file="${STATE_DIR}/pane-$(sanitize "${pane_id}").json"
+  url="$( [ -f "${state_file}" ] && jq -r ".${what}_url // empty" "${state_file}")"
+  if [ -z "${url}" ]; then
+    log "${pane_id} に紐づく ${what} が無い"
+    exit 1
+  fi
+  open "${url}"
+}
+
+# ---- board: pane と worktree の一覧をポップアップの fzf で出す ----
+
+# xargs の子プロセスとして呼ばれる。pane の無い worktree 1 件分のレコードを出す
+cmd_wt_record() {
+  local path="$1" branch="$2" key jira_json pr_json
+  key="$(extract_key "${branch}")"
+  [ -n "${key}" ] || return 0
+  jira_json="$(fetch_jira "${key}")"
+  # 件数が多いので、タイトル検索のフォールバックはせずブランチ名だけで引く
+  pr_json="$(fetch_pr "${path}" "${branch}" "")"
+  jq -nc --arg key "${key}" --arg wt "${path}" --arg branch "${branch}" \
+    --argjson jira "${jira_json:-null}" --argjson pr "${pr_json:-null}" \
+    '{pane_id: null, key: $key, wt_path: $wt, branch: $branch, jira: $jira, pr: $pr}'
+}
+
+# 標準入力のレコードを fzf の行にする。fzf には 5 列目だけを見せ、1〜4 列目は操作用に隠す:
+#   1: pane_id  2: PR の URL  3: Jira の URL  4: worktree のパス  5: 表示
+format_rows() {
+  jq --unbuffered -r --argjson tabs "$1" --argjson ws "$2" --arg base "${JIRA_BASE_URL}" "${JQ_DEFS}"'
+    def rgb:
+      {"jira_new": "147;153;178", "jira_doing": "137;180;250", "jira_done": "166;227;161", "jira_err": "243;139;168",
+       "pr_open": "166;227;161", "pr_draft": "147;153;178", "pr_merged": "203;166;247", "pr_closed": "243;139;168",
+       "ci_ok": "166;227;161", "ci_ng": "243;139;168", "ci_wait": "249;226;175",
+       "rv_ok": "166;227;161", "rv_ng": "243;139;168", "rv_wait": "249;226;175"}[.];
+    def paint($kind; $s): "\u001b[38;2;" + ($kind | rgb) + "m" + $s + "\u001b[0m";
+    def dim($s): "\u001b[2m" + $s + "\u001b[0m";
+    def spaces($n): if $n > 0 then " " * $n else "" end;
+    def clip($n): if length > $n then .[0:$n - 1] + "…" else . end;
+    def cell($plain; $painted; $n): $painted + spaces($n - ($plain | length));
+    select(.agent != null or .pane_id == null)
+    | . as $r
+    | (if $r.pane_id then ((($ws[$r.workspace_id] // "?") + "/" + ($tabs[$r.tab_id] // "?")) | clip(18)) else "worktree" end) as $loc
+    | ($r.jira // {}) as $j
+    | ($j | jira_kind) as $jk
+    | (($r.key // "") | if . == "" then "-" else . end) as $key
+    | (if $r.pr == null then {plain: "-", painted: dim("-")}
+       else
+         ($r.pr | pr_kind) as $pk
+         | ([($r.pr | ci_kind), ($r.pr | rv_kind)] | map(select(. != null)) | if $r.pr.state == "OPEN" then . else [] end) as $sub
+         | (($pk | icon) + " #" + ($r.pr.number | tostring) + ($r.pr | mismatch($r.branch // ""))) as $head
+         | {plain: ([$head] + ($sub | map(icon)) | join(" ")),
+            painted: ([paint($pk; $head)] + ($sub | map(paint(.; icon))) | join(" "))}
+       end) as $pr
+    | (if ($r.wt_path // "") == "" then "-" else (("wt" | icon) + " " + ($r.wt_path | split("/") | last | clip(32))) end) as $wt
+    | [($r.pane_id // "-"), ($r.pr.url // "-"),
+       (if $key != "-" and $base != "" then $base + "/browse/" + $key else "-" end),
+       (($r.wt_path // "") | if . == "" then "-" else . end),
+       ( (if $r.pane_id then cell($loc; $loc; 18) else cell($loc; dim($loc); 18) end)
+         + "  " + cell(("jira" | icon) + " " + $key; paint($jk; ("jira" | icon) + " " + $key); 16)
+         + "  " + cell($pr.plain; $pr.painted; 16)
+         + "  " + cell($wt; dim($wt); 36)
+         + "  " + (if ($j.status // "") != "" then paint($jk; $j.status) else "" end))]
+    | join("\t")'
+}
+
+cmd_board_rows() {
+  local panes covered tabs ws
+  panes="$(mktemp "${STATE_DIR}/board.XXXXXX")" || exit 1
+  covered="$(mktemp "${STATE_DIR}/board.XXXXXX")" || exit 1
+  # xargs で起動する子プロセスにも、同じディレクトリと強制取得の指定を引き継ぐ
+  export HERDR_PLUGIN_STATE_DIR="${STATE_DIR}" HERDR_PLUGIN_CONFIG_DIR="${CONFIG_DIR}" JIRA_PR_FORCE="${FORCE_FETCH}"
+
+  agent_panes | while read -r id; do resolve_pane "${id}"; done >"${panes}"
+  jq -r '.wt_path // empty' "${panes}" >"${covered}"
+  tabs="$("${HERDR}" tab list 2>/dev/null | jq -c '[.result.tabs[]? | {key: .tab_id, value: .label}] | from_entries')"
+  ws="$("${HERDR}" workspace list 2>/dev/null | jq -c '[.result.workspaces[]? | {key: .workspace_id, value: .label}] | from_entries')"
+  [ -n "${tabs}" ] || tabs='{}'
+  [ -n "${ws}" ] || ws='{}'
+  format_rows "${tabs}" "${ws}" <"${panes}"
+
+  # エージェント pane があるリポジトリの worktree のうち、pane に紐づかずキーを持つものを並べる
+  jq -r 'select((.cwd // "") != "") | .cwd' "${panes}" | while read -r cwd; do
+    (cd "${cwd}" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  done | sort -u | while read -r common; do
+    git --git-dir="${common}" worktree list --porcelain 2>/dev/null |
+      awk '/^worktree /{p=substr($0,10)} /^branch /{b=substr($0,8); sub("^refs/heads/","",b); print p "\t" b}'
+  done | while IFS="${TAB}" read -r p b; do
+    grep -qxF "${p}" "${covered}" && continue
+    [ -n "$(extract_key "${b}")" ] || continue
+    printf '%s\0%s\0' "${p}" "${b}"
+  done | xargs -0 -n 2 -P 6 "${SELF}" _wt-record | format_rows "${tabs}" "${ws}"
+
+  rm -f "${panes}" "${covered}"
+}
+
+# fzf の execute から呼ぶ。失敗時はポップアップにエラーを数秒出す（execute-silent だと何も起きないように見える）
+cmd_focus() {
+  local pane_id="$1" wt="$2" main out
+  if [ "${pane_id}" != "-" ]; then
+    out="$("${HERDR}" agent focus "${pane_id}" 2>&1)"
+  elif [ "${wt}" != "-" ]; then
+    # herdr は linked worktree 自身を起点にした open を linked_worktree_source で拒否する。
+    # 本体チェックアウト（worktree list の先頭）を起点に渡す
+    main="$(git -C "${wt}" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
+    out="$("${HERDR}" worktree open --cwd "${main:-${wt}}" --path "${wt}" --focus 2>&1)"
+  else
+    return 0
+  fi
+  if printf '%s' "${out}" | jq -e '.error' >/dev/null 2>&1; then
+    printf '移動できなかった: %s\n' "$(printf '%s' "${out}" | jq -r '.error.message')"
+    sleep 3
+    return 1
+  fi
+}
+
+cmd_board() {
+  command -v fzf >/dev/null 2>&1 || { log "fzf が見つからない"; sleep 3; exit 1; }
+  "${SELF}" board-rows | fzf --ansi --layout=reverse --delimiter "${TAB}" --with-nth 5 \
+    --prompt 'jira-pr> ' --info inline-right \
+    --header 'enter: PR   ctrl-j: Jira   ctrl-f: pane/worktreeへ移動   ctrl-r: 再取得   esc: 閉じる' \
+    --bind "enter:execute-silent([ {2} = - ] || open {2})" \
+    --bind "double-click:execute-silent([ {2} = - ] || open {2})" \
+    --bind "ctrl-j:execute-silent([ {3} = - ] || open {3})" \
+    --bind "ctrl-f:execute('${SELF}' focus {1} {4})+abort" \
+    --bind "ctrl-r:reload(JIRA_PR_FORCE=1 '${SELF}' board-rows)"
+  return 0
+}
+
+cmd_open_board() {
+  "${HERDR}" plugin pane open --plugin "${SOURCE_ID}" --entrypoint board >/dev/null
+}
+
+main() {
+  for c in jq git gh curl; do
+    command -v "${c}" >/dev/null 2>&1 || { log "${c} が見つからない"; exit 1; }
+  done
+  init_dirs
+  load_config
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "${cmd}" in
+    refresh) cmd_refresh "$@" ;;
+    status) cmd_status ;;
+    open) cmd_open "$@" ;;
+    event) cmd_event ;;
+    board) cmd_board ;;
+    board-rows) cmd_board_rows ;;
+    open-board) cmd_open_board ;;
+    focus) cmd_focus "$@" ;;
+    _wt-record) cmd_wt_record "$@" ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,65 @@
+id = "ymegane.jira-pr"
+name = "jira-pr"
+version = "0.3.0"
+# pane report-metadata のトークンと foreground_cwd を使う。動作確認は 0.9.5 のみ
+min_herdr_version = "0.9.5"
+platforms = ["macos"]
+description = "Show the Jira status, GitHub PR, and worktree of each agent pane in the Agents sidebar."
+
+[[startup]]
+command = ["bin/jira-pr", "event"]
+
+# worktree の増減は他 pane の紐付けにも効くので、全 pane を引き直す
+[[events]]
+on = "worktree.created"
+command = ["bin/jira-pr", "event"]
+
+[[events]]
+on = "worktree.opened"
+command = ["bin/jira-pr", "event"]
+
+[[events]]
+on = "worktree.removed"
+command = ["bin/jira-pr", "event"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["bin/jira-pr", "event"]
+
+# pane.updated（タイトル変更）は 0.9.5 ではプラグインのフックに使えない（link 時に unknown event）。
+# セッション名が後から付いた pane は、次にフォーカスしたときに拾う
+[[events]]
+on = "pane.focused"
+command = ["bin/jira-pr", "event"]
+
+[[panes]]
+id = "board"
+title = "jira-pr"
+placement = "popup"
+width = "90%"
+height = "70%"
+command = ["bin/jira-pr", "board"]
+
+[[actions]]
+id = "board"
+title = "jira-pr: open board"
+contexts = ["pane", "workspace"]
+command = ["bin/jira-pr", "open-board"]
+
+[[actions]]
+id = "refresh"
+title = "jira-pr: refresh all panes"
+contexts = ["pane", "workspace"]
+command = ["bin/jira-pr", "refresh", "--all", "--force"]
+
+[[actions]]
+id = "open-pr"
+title = "jira-pr: open PR of this pane"
+contexts = ["pane"]
+command = ["bin/jira-pr", "open", "pr"]
+
+[[actions]]
+id = "open-jira"
+title = "jira-pr: open Jira issue of this pane"
+contexts = ["pane"]
+command = ["bin/jira-pr", "open", "jira"]
