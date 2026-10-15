@@ -4,14 +4,20 @@
 
 | プラグイン | 概要 |
 |---|---|
-| [jira-pr](./jira-pr/) | エージェントpaneごとに、Jiraのステータス、GitHub PR、worktreeを Agentsサイドバーに表示する |
+| [jira-pr](./jira-pr/) | エージェントpaneごとに、Jiraのステータス、GitHub PR、worktreeを Agentsサイドバーとポップアップの一覧に表示する |
 
 ## 導入
 
-プライベートリポジトリなので、クローンしたディレクトリを `herdr plugin link` で登録する。
+herdrのGitHubインストールで入れる。
 
 ```bash
-git clone git@github.com:ymegane/herdr-plugins.git ~/Developer/github/herdr-plugins
+herdr plugin install ymegane/herdr-plugins/jira-pr
+```
+
+作者はクローンしたディレクトリを `herdr plugin link` で登録して使っており、`plugin install` での導入は試していない。手元で編集しながら使うなら、次のように登録する。
+
+```bash
+git clone https://github.com/ymegane/herdr-plugins.git ~/Developer/github/herdr-plugins
 herdr plugin link ~/Developer/github/herdr-plugins/jira-pr
 ```
 
