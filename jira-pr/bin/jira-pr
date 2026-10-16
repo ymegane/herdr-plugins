@@ -450,12 +450,16 @@ cmd_open() {
   if [ -z "${pane_id}" ] && [ -n "${ctx}" ]; then
     pane_id="$(printf '%s' "${ctx}" | jq -r '.focused_pane_id // empty' 2>/dev/null)"
   fi
-  [ -n "${pane_id}" ] || { log "対象の pane が分からない"; exit 1; }
+  [ -n "${pane_id}" ] || { report_error "対象の pane が分からない"; exit 1; }
   with_pane_lock "${pane_id}"
   state_file="${STATE_DIR}/pane-$(sanitize "${pane_id}").json"
   url="$( [ -f "${state_file}" ] && jq -r ".${field} // empty" "${state_file}")"
   if [ -z "${url}" ]; then
-    log "${pane_id} に紐づく ${what} が無い"
+    case "${what}" in
+      pr) report_error "この pane に紐づく PR が無い" ;;
+      jira) report_error "この pane に紐づく Jira 課題が無い" ;;
+      editor) report_error "この pane に紐づく worktree が無い" ;;
+    esac
     exit 1
   fi
   if [ "${what}" = editor ]; then
@@ -465,18 +469,28 @@ cmd_open() {
   fi
 }
 
+# board（fzf の execute）は端末の中なので画面に出す。キーやアクションから呼ばれたときは
+# 出力の行き先がプラグインログだけで、利用者には何も見えないため、herdr のトーストで知らせる
+report_error() {
+  log "$1"
+  if [ -t 1 ]; then
+    printf '%s\n' "$1"
+    sleep 2
+  else
+    "${HERDR}" notification show "jira-pr" --body "$1" >/dev/null 2>&1
+  fi
+}
+
 # EDITOR_CMD は "open -a Cursor" のように引数を含めて書けるよう、意図して単語分割する
 cmd_edit() {
   local path="${1:--}"
   if [ "${path}" = "-" ] || [ ! -d "${path}" ]; then
-    printf 'この行には worktree が無い\n'
-    sleep 2
+    report_error "この行には worktree が無い"
     return 1
   fi
   # shellcheck disable=SC2086
   ${EDITOR_CMD} "${path}" >/dev/null 2>&1 || {
-    printf 'エディタを起動できなかった: %s %s\n' "${EDITOR_CMD}" "${path}"
-    sleep 3
+    report_error "エディタを起動できなかった: ${EDITOR_CMD} ${path}"
     return 1
   }
 }

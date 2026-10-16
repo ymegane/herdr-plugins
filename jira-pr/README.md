@@ -155,7 +155,7 @@ command = "ymegane.jira-pr.board"
 
 `prefix+o`（通知先へ移動）や `prefix+j`（下のpaneへ移動）はherdrの既定で使われている。空いているキーは `herdr --default-config` で確かめる。
 
-アクションは `board`、`refresh`、`open-pr`、`open-jira`、`open-editor` の5つ。`open-*` はフォーカス中のpaneを対象にする。
+アクションは `board`、`refresh`、`open-pr`、`open-jira`、`open-editor` の5つ。`open-*` はフォーカス中のpaneを対象にする。紐づくPR、Jira課題、worktreeが無いときは、herdrのトースト通知で知らせる。通知の出し方は `[ui.toast]` の `delivery` に従う。
 
 `EDITOR_CMD` はherdrサーバの `PATH` で探される。`code` や `zed` のCLIが見つからないときは、`"open -a Cursor"` のように `open -a` で書くかフルパスで書く。
 
