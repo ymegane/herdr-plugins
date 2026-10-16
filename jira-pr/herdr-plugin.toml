@@ -1,6 +1,6 @@
 id = "ymegane.jira-pr"
 name = "jira-pr"
-version = "0.3.0"
+version = "0.4.0"
 # pane report-metadata のトークンと foreground_cwd を使う。動作確認は 0.9.5 のみ
 min_herdr_version = "0.9.5"
 platforms = ["macos"]
@@ -57,6 +57,12 @@ id = "open-pr"
 title = "jira-pr: open PR of this pane"
 contexts = ["pane"]
 command = ["bin/jira-pr", "open", "pr"]
+
+[[actions]]
+id = "open-editor"
+title = "jira-pr: open worktree of this pane in editor"
+contexts = ["pane"]
+command = ["bin/jira-pr", "open", "editor"]
 
 [[actions]]
 id = "open-jira"

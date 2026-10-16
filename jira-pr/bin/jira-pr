@@ -22,7 +22,8 @@ usage: jira-pr <command>
   refresh --all [--force]    全エージェント pane を解決してトークンを報告する
   refresh --pane ID [--force]
   status                     全エージェント pane の解決結果を表示する（報告はしない）
-  open pr|jira               HERDR_PANE_ID の PR / Jira をブラウザで開く
+  open pr|jira|editor        HERDR_PANE_ID の PR / Jira をブラウザで、worktree をエディタで開く
+  edit PATH                  PATH を EDITOR_CMD で開く
   open-board                 board をポップアップで開く
   board                      pane と worktree の一覧を fzf で出す（ポップアップの中で動く）
   event                      herdr の startup / event フックから呼ぶ
@@ -52,6 +53,7 @@ load_config() {
   KEYCHAIN_SERVICE="herdr-jira-pr"
   KEY_PATTERN='[A-Z][A-Z0-9]+-[0-9]+'
   CACHE_TTL_SEC=300
+  EDITOR_CMD="zed"
   if [ -n "${CONFIG_DIR}" ] && [ -f "${CONFIG_DIR}/config.env" ]; then
     # shellcheck disable=SC1091
     . "${CONFIG_DIR}/config.env"
@@ -438,8 +440,12 @@ cmd_status() {
 }
 
 cmd_open() {
-  local what="${1:-}" ctx="${HERDR_PLUGIN_CONTEXT_JSON:-}" pane_id url state_file
-  case "${what}" in pr | jira) ;; *) usage; exit 2 ;; esac
+  local what="${1:-}" ctx="${HERDR_PLUGIN_CONTEXT_JSON:-}" pane_id url state_file field
+  case "${what}" in
+    pr | jira) field="${what}_url" ;;
+    editor) field="wt_path" ;;
+    *) usage; exit 2 ;;
+  esac
   pane_id="${HERDR_PANE_ID:-}"
   if [ -z "${pane_id}" ] && [ -n "${ctx}" ]; then
     pane_id="$(printf '%s' "${ctx}" | jq -r '.focused_pane_id // empty' 2>/dev/null)"
@@ -447,12 +453,32 @@ cmd_open() {
   [ -n "${pane_id}" ] || { log "対象の pane が分からない"; exit 1; }
   with_pane_lock "${pane_id}"
   state_file="${STATE_DIR}/pane-$(sanitize "${pane_id}").json"
-  url="$( [ -f "${state_file}" ] && jq -r ".${what}_url // empty" "${state_file}")"
+  url="$( [ -f "${state_file}" ] && jq -r ".${field} // empty" "${state_file}")"
   if [ -z "${url}" ]; then
     log "${pane_id} に紐づく ${what} が無い"
     exit 1
   fi
-  open "${url}"
+  if [ "${what}" = editor ]; then
+    cmd_edit "${url}"
+  else
+    open "${url}"
+  fi
+}
+
+# EDITOR_CMD は "open -a Cursor" のように引数を含めて書けるよう、意図して単語分割する
+cmd_edit() {
+  local path="${1:--}"
+  if [ "${path}" = "-" ] || [ ! -d "${path}" ]; then
+    printf 'この行には worktree が無い\n'
+    sleep 2
+    return 1
+  fi
+  # shellcheck disable=SC2086
+  ${EDITOR_CMD} "${path}" >/dev/null 2>&1 || {
+    printf 'エディタを起動できなかった: %s %s\n' "${EDITOR_CMD}" "${path}"
+    sleep 3
+    return 1
+  }
 }
 
 # ---- board: pane と worktree の一覧をポップアップの fzf で出す ----
@@ -564,10 +590,11 @@ cmd_board() {
   command -v fzf >/dev/null 2>&1 || { log "fzf が見つからない"; sleep 3; exit 1; }
   "${SELF}" board-rows | fzf --ansi --layout=reverse --delimiter "${TAB}" --with-nth 5 \
     --prompt 'jira-pr> ' --info inline-right \
-    --header 'enter: PR   ctrl-j: Jira   ctrl-f: pane/worktreeへ移動   ctrl-r: 再取得   esc: 閉じる' \
+    --header 'enter: PR   ctrl-j: Jira   ctrl-o: エディタ   ctrl-f: pane/worktreeへ移動   ctrl-r: 再取得   esc: 閉じる' \
     --bind "enter:execute-silent([ {2} = - ] || open {2})" \
     --bind "double-click:execute-silent([ {2} = - ] || open {2})" \
     --bind "ctrl-j:execute-silent([ {3} = - ] || open {3})" \
+    --bind "ctrl-o:execute('${SELF}' edit {4})" \
     --bind "ctrl-f:execute('${SELF}' focus {1} {4})+abort" \
     --bind "ctrl-r:reload(JIRA_PR_FORCE=1 '${SELF}' board-rows)"
   return 0
@@ -594,6 +621,7 @@ main() {
     board-rows) cmd_board_rows ;;
     open-board) cmd_open_board ;;
     focus) cmd_focus "$@" ;;
+    edit) cmd_edit "$@" ;;
     _wt-record) cmd_wt_record "$@" ;;
     *) usage; exit 2 ;;
   esac

@@ -49,6 +49,7 @@ Jiraを取得できないときは、`$jira_new` にキーだけを出す。
 |---|---|
 | `enter` / ダブルクリック | PRをブラウザで開く |
 | `ctrl-j` | Jiraの課題をブラウザで開く |
+| `ctrl-o` | worktreeをエディタで開く。エディタは `config.env` の `EDITOR_CMD`（既定は `zed`）で決める |
 | `ctrl-f` | そのpaneへ移動する。paneの無いworktreeの行では、worktreeをherdrのworkspaceとして開く |
 | `ctrl-r` | キャッシュを使わずに取り直す |
 | `esc` | 閉じる |
@@ -154,7 +155,9 @@ command = "ymegane.jira-pr.board"
 
 `prefix+o`（通知先へ移動）や `prefix+j`（下のpaneへ移動）はherdrの既定で使われている。空いているキーは `herdr --default-config` で確かめる。
 
-アクションは `board`、`refresh`、`open-pr`、`open-jira` の4つ。
+アクションは `board`、`refresh`、`open-pr`、`open-jira`、`open-editor` の5つ。`open-*` はフォーカス中のpaneを対象にする。
+
+`EDITOR_CMD` はherdrサーバの `PATH` で探される。`code` や `zed` のCLIが見つからないときは、`"open -a Cursor"` のように `open -a` で書くかフルパスで書く。
 
 ## 動作確認
 
