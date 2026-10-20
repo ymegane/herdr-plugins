@@ -111,28 +111,50 @@ find_branch() {
 }
 
 # gh や Jira が落ちているときは期限切れのキャッシュでも出す。何も出さないより古い値のほうが役に立つ
+# 探す順: head ブランチ → タイトル内のキー → HEAD コミットの SHA。
+# SHA で探すのは、PR を手元で別名のブランチ（review/pr-123 など）に取り込んだ worktree のため。
+# 見つけた経路を matched_by に残し、ブランチ不一致の警告はタイトル検索で見つけたときだけ出す
 fetch_pr() {
-  local dir="$1" branch="$2" key="$3" common cache json
-  local fields="number,state,isDraft,reviewDecision,statusCheckRollup,url,headRefName"
+  local dir="$1" branch="$2" key="$3" sha="${4:-}" common cache json="" by=""
+  local fields="number,state,isDraft,reviewDecision,statusCheckRollup,url,headRefName,title"
   common="$(cd "${dir}" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-  cache="${STATE_DIR}/pr-$(hash_of "${common}|${branch}|${key}").json"
+  cache="${STATE_DIR}/pr-$(hash_of "${common}|${branch}|${key}|${sha}").json"
   if cache_fresh "${cache}"; then
     cat "${cache}"
     return 0
   fi
-  json=""
   if [ -n "${branch}" ]; then
     json="$(cd "${dir}" && gh pr list --head "${branch}" --state all --limit 5 --json "${fields}" 2>/dev/null)" || json=""
+    by="head"
   fi
   if { [ -z "${json}" ] || [ "${json}" = "[]" ]; } && [ -n "${key}" ]; then
     json="$(cd "${dir}" && gh pr list --search "${key} in:title" --state all --limit 5 --json "${fields}" 2>/dev/null)" || json=""
+    by="title"
+  fi
+  if { [ -z "${json}" ] || [ "${json}" = "[]" ]; } && [ -n "${sha}" ]; then
+    json="$(cd "${dir}" && gh pr list --search "${sha}" --state all --limit 5 --json "${fields}" 2>/dev/null)" || json=""
+    by="sha"
   fi
   if [ -z "${json}" ]; then
     [ -f "${cache}" ] && cat "${cache}"
     return 0
   fi
-  printf '%s' "${json}" | jq -c 'sort_by(.state != "OPEN") | .[0]' | write_atomic "${cache}"
+  printf '%s' "${json}" | jq -c --arg by "${by}" 'sort_by(.state != "OPEN") | .[0] | if . == null then null else . + {matched_by: $by} end' |
+    write_atomic "${cache}"
   cat "${cache}"
+}
+
+# Claude Code の transcript（<config>/projects/*/<セッション ID>.jsonl）は各行に作業ディレクトリ cwd を持つ。
+# セッション内で worktree へ移っても Claude Code のプロセスの cwd は変わらないため、ここから今の作業場所を取る。
+# transcript の形式は Claude Code の内部仕様で、読めなければ空を返し呼び出し側は foreground_cwd に戻る
+claude_cwd() {
+  local f
+  for f in "${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"/projects/*/"$1".jsonl; do
+    [ -f "${f}" ] || continue
+    # 書き込み途中の行を読むことがあるので、壊れた行は fromjson? で飛ばす
+    tail -n 200 "${f}" | jq -R -r 'fromjson? | select(type == "object" and (.cwd | type) == "string") | .cwd' | tail -n 1
+    return 0
+  done
 }
 
 jira_auth_ok() {
@@ -228,7 +250,7 @@ def icon:
   {"jira": "", "pr_open": "", "pr_draft": "", "pr_merged": "", "pr_closed": "",
    "ci_ok": "", "ci_ng": "", "ci_wait": "",
    "rv_ok": "", "rv_ng": "", "rv_wait": "", "wt": ""}[.];
-def mismatch($branch): if ($branch != "" and .headRefName != $branch) then " ⚠" else "" end;
+def mismatch($branch): if (.matched_by == "title" and $branch != "" and .headRefName != $branch) then " ⚠" else "" end;
 '
 
 # herdr のサイドバーはトークン単位でしか色を指定できない。状態ごとに別トークンへ振り分け、
@@ -263,10 +285,10 @@ report_tokens() {
   "${HERDR}" "${args[@]}" >/dev/null || log "report-metadata ${pane_id} に失敗"
 }
 
-# 1 行の JSON を出す: {pane_id, workspace_id, tab_id, agent, cwd, key, key_from, wt_path, branch, jira, pr}
+# 1 行の JSON を出す: {pane_id, workspace_id, tab_id, agent, cwd, cwd_from, key, key_from, wt_path, branch, jira, pr}
 resolve_pane() {
-  local pane_id="$1" pane agent cwd="" key="" key_from="" branch="" pr_branch="" wt_path="" in_git=0 line
-  local jira_json="" pr_json=""
+  local pane_id="$1" pane agent session cwd="" cwd_from="" key="" key_from="" branch="" pr_branch="" pr_sha="" wt_path=""
+  local in_git=0 line jira_json="" pr_json=""
 
   pane="$("${HERDR}" pane get "${pane_id}" 2>/dev/null | jq -c '.result.pane // empty')"
   [ -n "${pane}" ] || return 0
@@ -276,21 +298,33 @@ resolve_pane() {
     return 0
   fi
 
-  cwd="$(printf '%s' "${pane}" | jq -r '.foreground_cwd // .cwd // empty')"
+  session="$(printf '%s' "${pane}" | jq -r 'if .agent == "claude" then (.agent_session.value // empty) else empty end')"
+  if [ -n "${session}" ]; then
+    cwd="$(claude_cwd "${session}")"
+    [ -n "${cwd}" ] && [ -d "${cwd}" ] && cwd_from="claude" || cwd=""
+  fi
+  if [ -z "${cwd}" ]; then
+    cwd="$(printf '%s' "${pane}" | jq -r '.foreground_cwd // .cwd // empty')"
+    cwd_from="process"
+  fi
+
   if [ -n "${cwd}" ] && git -C "${cwd}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     in_git=1
     branch="$(git -C "${cwd}" symbolic-ref --short -q HEAD)"
     key="$(extract_key "${branch}")"
-    if [ -n "${key}" ]; then
-      key_from="branch"
-      pr_branch="${branch}"
+    [ -n "${key}" ] && key_from="branch"
+    # 本体チェックアウト以外（linked worktree）にいるなら、ブランチ名にキーが無くてもその worktree を採る
+    if [ -n "${key}" ] ||
+      [ "$(git -C "${cwd}" rev-parse --path-format=absolute --git-dir)" != "$(git -C "${cwd}" rev-parse --path-format=absolute --git-common-dir)" ]; then
       wt_path="$(git -C "${cwd}" rev-parse --show-toplevel)"
+      pr_branch="${branch}"
+      pr_sha="$(git -C "${cwd}" rev-parse HEAD 2>/dev/null)"
     fi
   fi
 
-  # 本体チェックアウトで起動したエージェントは cwd のブランチにキーが無い。
+  # 本体チェックアウトにいるエージェントは cwd のブランチにキーが無い。
   # Claude Code のセッション名（pane ラベル / ターミナルタイトル）からキーを取り、worktree を逆引きする
-  if [ -z "${key}" ]; then
+  if [ -z "${key}" ] && [ -z "${wt_path}" ]; then
     key="$(extract_key "$(printf '%s' "${pane}" | jq -r '[.label, .terminal_title_stripped] | map(select(. != null)) | join(" ")')")"
     if [ -n "${key}" ]; then
       key_from="title"
@@ -306,18 +340,23 @@ resolve_pane() {
     fi
   fi
 
+  if [ "${in_git}" = 1 ] && { [ -n "${pr_branch}" ] || [ -n "${key}" ] || [ -n "${pr_sha}" ]; }; then
+    pr_json="$(fetch_pr "${wt_path:-${cwd}}" "${pr_branch}" "${key}" "${pr_sha}")"
+  fi
+  # ブランチ名にキーが無い worktree（レビュー用など）は、見つかった PR のブランチ名かタイトルからキーを取る
+  if [ -z "${key}" ] && [ -n "${pr_json}" ] && [ "${pr_json}" != "null" ]; then
+    key="$(extract_key "$(printf '%s' "${pr_json}" | jq -r '[.headRefName, .title] | map(select(. != null)) | join(" ")')")"
+    [ -n "${key}" ] && key_from="pr"
+  fi
   if [ -n "${key}" ]; then
     jira_json="$(fetch_jira "${key}")"
   fi
-  if [ "${in_git}" = 1 ] && { [ -n "${pr_branch}" ] || [ -n "${key}" ]; }; then
-    pr_json="$(fetch_pr "${wt_path:-${cwd}}" "${pr_branch}" "${key}")"
-  fi
 
-  jq -nc --argjson pane "${pane}" --arg cwd "${cwd}" --arg key "${key}" --arg from "${key_from}" \
+  jq -nc --argjson pane "${pane}" --arg cwd "${cwd}" --arg cwd_from "${cwd_from}" --arg key "${key}" --arg from "${key_from}" \
     --arg wt "${wt_path}" --arg branch "${pr_branch}" \
     --argjson jira "${jira_json:-null}" --argjson pr "${pr_json:-null}" \
     '{pane_id: $pane.pane_id, workspace_id: $pane.workspace_id, tab_id: $pane.tab_id, agent: $pane.agent,
-      cwd: $cwd, key: $key, key_from: $from, wt_path: $wt, branch: $branch, jira: $jira, pr: $pr}'
+      cwd: $cwd, cwd_from: $cwd_from, key: $key, key_from: $from, wt_path: $wt, branch: $branch, jira: $jira, pr: $pr}'
 }
 
 refresh_pane() {
@@ -433,7 +472,7 @@ cmd_status() {
   agent_panes | while read -r id; do
     rec="$(resolve_pane "${id}")"
     printf '%s' "${rec}" | jq -r --argjson t "$(printf '%s' "${rec}" | build_tokens "")" \
-      '[.pane_id, .agent, (.key | if . == "" then "-" else . end), (.key_from | if . == "" then "-" else . end),
+      '[.pane_id, .agent, (.key | if . == "" then "-" else . end), ((.cwd_from // "-") + "/" + (.key_from | if . == "" then "-" else . end)),
         (.wt_path | if . == "" then "-" else . end), (.branch | if . == "" then "-" else . end),
         ($t | to_entries | map(select(.value != "") | "\(.key)=\(.value)") | join(" ") | if . == "" then "-" else . end)] | @tsv'
   done
@@ -499,12 +538,14 @@ cmd_edit() {
 
 # xargs の子プロセスとして呼ばれる。pane の無い worktree 1 件分のレコードを出す
 cmd_wt_record() {
-  local path="$1" branch="$2" key jira_json pr_json
+  local path="$1" branch="$2" key jira_json="" pr_json
   key="$(extract_key "${branch}")"
-  [ -n "${key}" ] || return 0
-  jira_json="$(fetch_jira "${key}")"
-  # 件数が多いので、タイトル検索のフォールバックはせずブランチ名だけで引く
-  pr_json="$(fetch_pr "${path}" "${branch}" "")"
+  # 件数が多いので、タイトル検索のフォールバックはせず、ブランチ名と HEAD の SHA だけで引く
+  pr_json="$(fetch_pr "${path}" "${branch}" "" "$(git -C "${path}" rev-parse HEAD 2>/dev/null)")"
+  if [ -z "${key}" ] && [ -n "${pr_json}" ] && [ "${pr_json}" != "null" ]; then
+    key="$(extract_key "$(printf '%s' "${pr_json}" | jq -r '[.headRefName, .title] | map(select(. != null)) | join(" ")')")"
+  fi
+  [ -n "${key}" ] && jira_json="$(fetch_jira "${key}")"
   jq -nc --arg key "${key}" --arg wt "${path}" --arg branch "${branch}" \
     --argjson jira "${jira_json:-null}" --argjson pr "${pr_json:-null}" \
     '{pane_id: null, key: $key, wt_path: $wt, branch: $branch, jira: $jira, pr: $pr}'
@@ -569,11 +610,11 @@ cmd_board_rows() {
   jq -r 'select((.cwd // "") != "") | .cwd' "${panes}" | while read -r cwd; do
     (cd "${cwd}" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
   done | sort -u | while read -r common; do
+    # 先頭は本体チェックアウトなので除く。レビュー用などキーの無い linked worktree も並べ、キーは PR から取る
     git --git-dir="${common}" worktree list --porcelain 2>/dev/null |
-      awk '/^worktree /{p=substr($0,10)} /^branch /{b=substr($0,8); sub("^refs/heads/","",b); print p "\t" b}'
+      awk '/^worktree /{n++; p=substr($0,10)} /^branch /{b=substr($0,8); sub("^refs/heads/","",b); if (n > 1) print p "\t" b}'
   done | while IFS="${TAB}" read -r p b; do
     grep -qxF "${p}" "${covered}" && continue
-    [ -n "$(extract_key "${b}")" ] || continue
     printf '%s\0%s\0' "${p}" "${b}"
   done | xargs -0 -n 2 -P 6 "${SELF}" _wt-record | format_rows "${tabs}" "${ws}"
 

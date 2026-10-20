@@ -15,12 +15,17 @@ claude
 
 ## 紐付けの規則
 
-プラグインは次の順でpaneのJiraキーを決める。
+プラグインは、まずpaneで作業しているディレクトリを決める。Claude Codeのpaneでは、herdrが持つセッションIDからtranscript（`~/.claude/projects/*/<セッションID>.jsonl`）を探し、最後に記録された `cwd` を使う。Claude Codeはセッションの途中でworktreeへ移っても、プロセスのcwdが起動時のままになるためである。transcriptが読めないときと、Claude Code以外のエージェントでは、paneの `foreground_cwd` を使う。transcriptの形式はClaude Codeの内部仕様なので、将来読めなくなる可能性がある。
 
-1. paneの `foreground_cwd` のブランチ名にキーがあれば、それを使う。PRはそのブランチで引き、worktreeはそのチェックアウトになる
-2. ブランチ名にキーが無ければ、paneのラベルとターミナルタイトル（Claude Codeのセッション名）からキーを取る。続けて同じリポジトリの `git worktree list` からキーを含むブランチのworktreeを探し、見つからなければローカルブランチを探す
+続けて、次の順でworktree、PR、Jiraキーを決める。
 
-PRは `gh pr list --head <ブランチ>` で探し、見つからなければタイトルにキーを含むPRを探す。複数あればOPENを優先する。PRのheadブランチが手順で決めたブランチと違うときは、PR番号の後ろに `⚠` を付ける。
+1. 作業ディレクトリのブランチ名にキーがあるか、作業ディレクトリが本体チェックアウト以外（linked worktree）にあれば、そのチェックアウトをworktreeとする
+2. 1に当てはまらなければ（本体チェックアウトにいるとき）、paneのラベルとターミナルタイトル（Claude Codeのセッション名）からキーを取る。続けて同じリポジトリの `git worktree list` からキーを含むブランチのworktreeを探し、見つからなければローカルブランチを探す
+3. ブランチ名にキーが無いworktree（`review/pr-123` のようなレビュー用のブランチなど）では、見つかったPRのheadブランチ名かタイトルからキーを取る
+
+PRは、headブランチ、タイトル内のキー、worktreeのHEADコミットのSHAの順に `gh pr list` で探す。SHAで探すのは、PRを手元で別名のブランチに取り込んだworktreeのためである。複数あればOPENを優先する。タイトル検索で見つけたPRのheadブランチが手順で決めたブランチと違うときは、PR番号の後ろに `⚠` を付ける。
+
+紐付けは今いる場所を表す。Claude Codeがレビュー後に本体チェックアウトへ戻ると、そのpaneの紐付けは外れる。
 
 キーは `ABC-12` が `ABC-123` のブランチに一致しないよう、数字の途中で切れた一致を除外する。
 
@@ -43,7 +48,7 @@ Jiraを取得できないときは、`$jira_new` にキーだけを出す。
 
 アクション `jira-pr: open board` は、エージェントpaneとworktreeの一覧をポップアップのfzfで開く。
 
-一覧の上の段にはエージェントpaneを並べる。その下には、エージェントpaneがあるリポジトリのworktreeのうち、どのpaneにも紐づかずブランチ名にキーを含むものを並べる。PRがmergedのまま残ったworktreeも、ここで見つけられる。各行は、場所、Jiraキー、PRとCI・レビュー、worktree、Jiraのステータスの順に表示する。色はサイドバーと同じ規則で付ける。
+一覧の上の段にはエージェントpaneを並べる。その下には、エージェントpaneがあるリポジトリのlinked worktreeのうち、どのpaneにも紐づかないものを並べる。ブランチ名にキーが無いworktreeは、PRからキーを取る。PRがmergedのまま残ったworktreeも、ここで見つけられる。各行は、場所、Jiraキー、PRとCI・レビュー、worktree、Jiraのステータスの順に表示する。色はサイドバーと同じ規則で付ける。
 
 | キー | 動作 |
 |---|---|
@@ -54,7 +59,7 @@ Jiraを取得できないときは、`$jira_new` にキーだけを出す。
 | `ctrl-r` | キャッシュを使わずに取り直す |
 | `esc` | 閉じる |
 
-paneの無いworktreeのPRはブランチ名だけで探し、タイトル検索はしない。worktreeごとに `gh` を6並列で呼ぶので、worktreeが30個あるリポジトリで初回は8秒ほどかかる。2回目以降は `CACHE_TTL_SEC` の間キャッシュを使う。
+paneの無いworktreeのPRはブランチ名とHEADコミットのSHAで探し、タイトル検索はしない。worktreeごとに `gh` を6並列で呼ぶので、worktreeが40個ほどあるリポジトリで初回は10秒ほどかかる。2回目以降は `CACHE_TTL_SEC` の間キャッシュを使う。
 
 boardの色はスクリプトに書いてある。`config.toml` のサイドバーの色を変えても、boardの色は変わらない。
 
