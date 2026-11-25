@@ -25,7 +25,7 @@ usage: jira-pr <command>
   open pr|jira|editor        HERDR_PANE_ID の PR / Jira をブラウザで、worktree をエディタで開く
   edit PATH                  PATH を EDITOR_CMD で開く
   open-board                 board をポップアップで開く
-  board                      pane と worktree の一覧を fzf で出す（ポップアップの中で動く）
+  board                      レビュー依頼、pane、worktree の一覧を fzf で出す（ポップアップの中で動く）
   event                      herdr の startup / event フックから呼ぶ
 EOF
 }
@@ -54,6 +54,7 @@ load_config() {
   KEY_PATTERN='[A-Z][A-Z0-9]+-[0-9]+'
   CACHE_TTL_SEC=300
   EDITOR_CMD="zed"
+  REVIEW_QUERY="review-requested:@me"
   if [ -n "${CONFIG_DIR}" ] && [ -f "${CONFIG_DIR}/config.env" ]; then
     # shellcheck disable=SC1091
     . "${CONFIG_DIR}/config.env"
@@ -142,6 +143,30 @@ fetch_pr() {
   printf '%s' "${json}" | jq -c --arg by "${by}" 'sort_by(.state != "OPEN") | .[0] | if . == null then null else . + {matched_by: $by} end' |
     write_atomic "${cache}"
   cat "${cache}"
+}
+
+# 1 件 1 行で board のレコードを出す。リポジトリをまたぐので gh search で引き、作成の古い順に並べる。
+# search の結果には head ブランチも CI もレビュー判定も無いため、キーはタイトルからだけ取る
+fetch_reviews() {
+  local cache="${STATE_DIR}/reviews.json" json q
+  [ -n "${REVIEW_QUERY}" ] || return 0
+  if ! cache_fresh "${cache}"; then
+    # REVIEW_QUERY に複数の修飾子を書けるよう単語分割し、gh へ別々の引数で渡す
+    read -r -a q <<<"${REVIEW_QUERY}"
+    json="$(gh search prs "${q[@]}" --state=open --archived=false --limit 50 \
+      --json number,title,url,repository,author,isDraft,createdAt 2>/dev/null)" || json=""
+    if [ -n "${json}" ]; then
+      printf '%s' "${json}" | write_atomic "${cache}"
+    else
+      log "レビュー依頼を取得できなかった: gh search prs ${REVIEW_QUERY}"
+    fi
+  fi
+  [ -f "${cache}" ] || return 0
+  jq -c --arg pat "${KEY_PATTERN}" '
+    sort_by(.createdAt)[]
+    | {pane_id: null, kind: "review", key: ([.title | match($pat).string][0] // ""),
+       wt_path: null, branch: null, repo: .repository.name, author: .author.login, created_at: .createdAt,
+       jira: null, pr: {number, state: "OPEN", isDraft, url, title}}' "${cache}"
 }
 
 # Claude Code の transcript（<config>/projects/*/<セッション ID>.jsonl）は各行に作業ディレクトリ cwd を持つ。
@@ -567,7 +592,9 @@ format_rows() {
     def cell($plain; $painted; $n): $painted + spaces($n - ($plain | length));
     select(.agent != null or .pane_id == null)
     | . as $r
-    | (if $r.pane_id then ((($ws[$r.workspace_id] // "?") + "/" + ($tabs[$r.tab_id] // "?")) | clip(18)) else "worktree" end) as $loc
+    | ($r.kind == "review") as $review
+    | (if $r.pane_id then ((($ws[$r.workspace_id] // "?") + "/" + ($tabs[$r.tab_id] // "?")) | clip(18))
+       elif $review then "review" else "worktree" end) as $loc
     | ($r.jira // {}) as $j
     | ($j | jira_kind) as $jk
     | (($r.key // "") | if . == "" then "-" else . end) as $key
@@ -579,15 +606,22 @@ format_rows() {
          | {plain: ([$head] + ($sub | map(icon)) | join(" ")),
             painted: ([paint($pk; $head)] + ($sub | map(paint(.; icon))) | join(" "))}
        end) as $pr
-    | (if ($r.wt_path // "") == "" then "-" else (("wt" | icon) + " " + ($r.wt_path | split("/") | last | clip(32))) end) as $wt
+    | (if $review then ($r.repo // "-" | clip(36))
+       elif ($r.wt_path // "") == "" then "-" else (("wt" | icon) + " " + ($r.wt_path | split("/") | last | clip(32))) end) as $wt
+    | (if $review then
+         ((now - ($r.created_at | fromdateiso8601)) / 3600 | floor) as $h
+         | (if $h < 24 then ($h | tostring) + "h" else ($h / 24 | floor | tostring) + "d" end) as $age
+         | (if $key == "-" then $r.pr.title else ($r.pr.title | sub("^\\s*\\[?" + $key + "\\]?[\\s:-]*"; "")) end) as $title
+         | cell($age; paint("rv_wait"; $age); 4) + " " + ($title | clip(60)) + dim(" @" + ($r.author // "?"))
+       elif ($j.status // "") != "" then paint($jk; $j.status) else "" end) as $tail
     | [($r.pane_id // "-"), ($r.pr.url // "-"),
        (if $key != "-" and $base != "" then $base + "/browse/" + $key else "-" end),
        (($r.wt_path // "") | if . == "" then "-" else . end),
-       ( (if $r.pane_id then cell($loc; $loc; 18) else cell($loc; dim($loc); 18) end)
+       ( (if $r.pane_id then cell($loc; $loc; 18) elif $review then cell($loc; paint("rv_wait"; $loc); 18) else cell($loc; dim($loc); 18) end)
          + "  " + cell(("jira" | icon) + " " + $key; paint($jk; ("jira" | icon) + " " + $key); 16)
          + "  " + cell($pr.plain; $pr.painted; 16)
          + "  " + cell($wt; dim($wt); 36)
-         + "  " + (if ($j.status // "") != "" then paint($jk; $j.status) else "" end))]
+         + "  " + $tail)]
     | join("\t")'
 }
 
@@ -604,6 +638,7 @@ cmd_board_rows() {
   ws="$("${HERDR}" workspace list 2>/dev/null | jq -c '[.result.workspaces[]? | {key: .workspace_id, value: .label}] | from_entries')"
   [ -n "${tabs}" ] || tabs='{}'
   [ -n "${ws}" ] || ws='{}'
+  fetch_reviews | format_rows "${tabs}" "${ws}"
   format_rows "${tabs}" "${ws}" <"${panes}"
 
   # エージェント pane があるリポジトリの worktree のうち、pane に紐づかずキーを持つものを並べる

@@ -46,9 +46,11 @@ Jiraを取得できないときは、`$jira_new` にキーだけを出す。
 
 ## board
 
-アクション `jira-pr: open board` は、エージェントpaneとworktreeの一覧をポップアップのfzfで開く。
+アクション `jira-pr: open board` は、自分宛てのレビュー依頼、エージェントpane、worktreeの一覧をポップアップのfzfで開く。
 
-一覧の上の段にはエージェントpaneを並べる。その下には、エージェントpaneがあるリポジトリのlinked worktreeのうち、どのpaneにも紐づかないものを並べる。ブランチ名にキーが無いworktreeは、PRからキーを取る。PRがmergedのまま残ったworktreeも、ここで見つけられる。各行は、場所、Jiraキー、PRとCI・レビュー、worktree、Jiraのステータスの順に表示する。色はサイドバーと同じ規則で付ける。
+一覧の先頭には、自分にレビューが依頼されたopenのPRを `review` 行として、作成の古い順に並べる。リポジトリはまたいで、`gh search prs` で引く。各行は、Jiraキー、PR番号、リポジトリ名、作成からの経過時間、タイトル、作成者の順に表示する。キーはPRのタイトルから取り、タイトル先頭のキーは表示から外す。検索の結果にはCIとレビューの判定が含まれないので、`review` 行には出さない。検索条件は `config.env` の `REVIEW_QUERY`（既定は `review-requested:@me`）で変えられる。既定の条件は、自分が属するチームへの依頼も含む。自分個人への依頼だけにするなら `user-review-requested:@me` を書く。空にすると `review` 行を出さない。
+
+その下にはエージェントpaneを並べる。さらにその下には、エージェントpaneがあるリポジトリのlinked worktreeのうち、どのpaneにも紐づかないものを並べる。ブランチ名にキーが無いworktreeは、PRからキーを取る。PRがmergedのまま残ったworktreeも、ここで見つけられる。各行は、場所、Jiraキー、PRとCI・レビュー、worktree、Jiraのステータスの順に表示する。色はサイドバーと同じ規則で付ける。
 
 | キー | 動作 |
 |---|---|
