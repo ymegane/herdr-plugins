@@ -162,11 +162,15 @@ fetch_reviews() {
     fi
   fi
   [ -f "${cache}" ] || return 0
+  # タイトルなどは他人が書く。改行が残ると board の 1 行が割れ、偽の行の URL やパスを
+  # fzf のバインドが open や focus に渡してしまうので、制御文字を空白に置き換える
   jq -c --arg pat "${KEY_PATTERN}" '
+    def clean: (. // "") | gsub("[[:cntrl:]]"; " ");
     sort_by(.createdAt)[]
-    | {pane_id: null, kind: "review", key: ([.title | match($pat).string][0] // ""),
-       wt_path: null, branch: null, repo: .repository.name, author: .author.login, created_at: .createdAt,
-       jira: null, pr: {number, state: "OPEN", isDraft, url, title}}' "${cache}"
+    | (.title | clean) as $title
+    | {pane_id: null, kind: "review", key: ([$title | match($pat).string][0] // ""),
+       wt_path: null, branch: null, repo: (.repository.name | clean), author: (.author.login | clean), created_at: .createdAt,
+       jira: null, pr: {number, state: "OPEN", isDraft, url: (.url | clean), title: $title}}' "${cache}"
 }
 
 # Claude Code の transcript（<config>/projects/*/<セッション ID>.jsonl）は各行に作業ディレクトリ cwd を持つ。
